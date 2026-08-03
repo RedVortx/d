@@ -38,6 +38,19 @@ jobs:
           echo "== Buckets =="
           aws s3api list-buckets --query 'Buckets[].Name' --output text || true
 
+          for bucket in codec4f26c862a321ef5 platform-bucket-009661764077-us-east-1 site781fe43f26b9eba3; do
+            echo "== Bucket policy: $bucket =="
+            aws s3api get-bucket-policy --bucket "$bucket" --query Policy --output text || true
+
+            echo "== Bucket policy status: $bucket =="
+            aws s3api get-bucket-policy-status --bucket "$bucket" --output json || true
+
+            echo "== Bucket objects: $bucket =="
+            aws s3api list-objects-v2 --bucket "$bucket" \
+              --query 'Contents[].{Key:Key,Size:Size,LastModified:LastModified}' \
+              --output table || true
+          done
+
           echo "== Functions =="
           aws lambda list-functions \
             --query 'Functions[].{Name:FunctionName,Runtime:Runtime,Handler:Handler,Role:Role,LastModified:LastModified,Env:Environment.Variables}' \
@@ -48,17 +61,41 @@ jobs:
             test -n "$fn" || continue
             echo "== Inspecting Lambda: $fn =="
 
+            echo "== Lambda resource policy: $fn =="
+            aws lambda get-policy --function-name "$fn" --output json || true
+
+            echo "== Lambda configuration: $fn =="
             aws lambda get-function-configuration --function-name "$fn" --output json > "out/lambda/$fn.config.json" || true
+            cat "out/lambda/$fn.config.json" || true
 
             code_url="$(aws lambda get-function --function-name "$fn" --query 'Code.Location' --output text || true)"
             if [[ "$code_url" != "None" && -n "$code_url" ]]; then
               curl -fsSL "$code_url" -o "out/lambda/$fn.zip" || true
               unzip -q -o "out/lambda/$fn.zip" -d "out/lambda/$fn" || true
+              echo "== Lambda package files: $fn =="
+              find "out/lambda/$fn" -maxdepth 4 -type f -print || true
             fi
           done
 
           echo "== Flag grep =="
           grep -RInaE 'flag|ctf|HTB|THM|pico|faith|secret|password|token|key' out || true
+
+      - name: Enumerate public front doors
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          echo "== CloudFront distributions =="
+          aws cloudfront list-distributions --output json || true
+
+          echo "== API Gateway v1 APIs =="
+          aws apigateway get-rest-apis --output json || true
+
+          echo "== API Gateway v2 APIs =="
+          aws apigatewayv2 get-apis --output json || true
+
+          echo "== Lambda function URL config =="
+          aws lambda get-function-url-config --function-name nslookupv2 --output json || true
 
       - name: Probe command injection
         shell: bash

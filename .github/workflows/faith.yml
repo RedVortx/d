@@ -1,4 +1,4 @@
-name: CTF AWS Discovery
+name: CTF Lambda and S3 Discovery
 
 on:
   workflow_dispatch:
@@ -22,115 +22,110 @@ jobs:
           aws-region: us-east-1
           role-session-name: ctf-discovery
 
-      - name: Verify identity
-        run: |
-          set -euo pipefail
-          aws sts get-caller-identity
-
-      - name: Discover frontend and API endpoints
-        shell: bash
+      - name: List Lambda functions
         run: |
           set -euo pipefail
 
           mkdir -p discovery
 
-          echo "=== CloudFront distributions ==="
-          aws cloudfront list-distributions \
-            --query 'DistributionList.Items[].{
-              Id:Id,
-              DomainName:DomainName,
-              Status:Status,
-              Enabled:Enabled,
-              Origins:Origins.Items[].DomainName
-            }' \
-            --output json | tee discovery/cloudfront.json
-
-          echo
-          echo "=== API Gateway REST APIs ==="
-          aws apigateway get-rest-apis \
-            --query 'items[].{Id:id,Name:name,Description:description}' \
-            --output json | tee discovery/api-gateway-rest.json
-
-          echo
-          echo "=== API Gateway HTTP/WebSocket APIs ==="
-          aws apigatewayv2 get-apis \
-            --query 'Items[].{
-              ApiId:ApiId,
-              Name:Name,
-              ProtocolType:ProtocolType,
-              ApiEndpoint:ApiEndpoint
-            }' \
-            --output json | tee discovery/api-gateway-v2.json
-
-          echo
-          echo "=== S3 buckets ==="
-          aws s3api list-buckets \
-            --query 'Buckets[].Name' \
-            --output json | tee discovery/s3-buckets.json
-
-          echo
-          echo "=== Lambda functions ==="
           aws lambda list-functions \
+            --region us-east-1 \
             --query 'Functions[].{
-              FunctionName:FunctionName,
-              Runtime:Runtime,
-              Description:Description
+              name:FunctionName,
+              runtime:Runtime,
+              handler:Handler,
+              description:Description,
+              env:Environment
             }' \
-            --output json | tee discovery/lambda-functions.json
+            --output json \
+            > discovery/lambda.json
 
-          echo
-          echo "=== Candidate frontend URLs ==="
+          cat discovery/lambda.json
 
-          python - <<'PY'
-          import json
-          from pathlib import Path
-
-          cloudfront = json.loads(
-              Path("discovery/cloudfront.json").read_text()
-          )
-
-          for item in cloudfront:
-              domain = item.get("DomainName")
-              if domain:
-                  print(f"https://{domain}")
-
-          apis = json.loads(
-              Path("discovery/api-gateway-v2.json").read_text()
-          )
-
-          for item in apis:
-              endpoint = item.get("ApiEndpoint")
-              if endpoint:
-                  print(endpoint)
-          PY
-
-      - name: Inspect S3 bucket metadata
-        shell: bash
+      - name: Fetch Lambda configurations and code
         run: |
           set -euo pipefail
 
-          while read -r bucket; do
-            [ -z "$bucket" ] && continue
+          mkdir -p discovery/lambda-code
 
-            echo "=== Bucket: $bucket ==="
+          for fn in $(jq -r '.[].name' discovery/lambda.json); do
+            safe="$(printf '%s' "$fn" | tr -c 'a-zA-Z0-9' '_')"
 
-            aws s3api get-bucket-location \
-              --bucket "$bucket" \
-              --output json || true
+            echo "=== $fn ==="
 
-            aws s3api get-bucket-policy-status \
-              --bucket "$bucket" \
-              --output json || true
+            aws lambda get-function \
+              --region us-east-1 \
+              --function-name "$fn" \
+              --output json \
+              > "discovery/$safe.describe.json" || true
 
-            aws s3api get-bucket-policy \
-              --bucket "$bucket" \
-              --output json || true
-          done < <(
-            jq -r '.[]' discovery/s3-buckets.json
-          )
+            aws lambda get-function-configuration \
+              --region us-east-1 \
+              --function-name "$fn" \
+              --output json \
+              > "discovery/$safe.config.json" || true
 
-      - name: Upload discovery results
+            code_url="$(
+              jq -r '.Code.Location // empty' \
+                "discovery/$safe.describe.json" 2>/dev/null || true
+            )"
+
+            if [ -n "$code_url" ]; then
+              curl -sS -L "$code_url" \
+                -o "discovery/lambda-$safe.zip" || true
+              unzip -q -o \
+                "discovery/lambda-$safe.zip" \
+                -d "discovery/lambda-$safe" || true
+              echo "--- $fn directory ---"
+              ls -la "discovery/lambda-$safe" || true
+            fi
+          done
+
+      - name: List S3 buckets
+        run: |
+          set -euo pipefail
+
+          aws s3api list-buckets \
+            --query 'Buckets[].Name' \
+            --output json > discovery/buckets.json
+
+          cat discovery/buckets.json
+
+      - name: List origin bucket contents
+        run: |
+          set -u
+
+          bucket="site781fe43f26b9eba3"
+
+          aws s3api list-objects-v2 \
+            --bucket "$bucket" \
+            --query 'Contents[].{
+              key:Key,
+              size:Size,
+              etag:ETag,
+              lastModified:LastModified
+            }' \
+            --output json || true
+
+      - name: Fetch CloudFront details
+        run: |
+          set -euo pipefail
+
+          aws cloudfront get-distribution \
+            --id EKD9KH16RB5G3 \
+            --query 'Distribution.{
+              config:DistributionConfig,
+              orig:DistributionConfig.Origins.Items,
+              aliases:DistributionConfig.Aliases.Items,
+              defaultCache:DistributionConfig.DefaultCacheBehavior
+            }' \
+            --output json \
+            > discovery/cloudfront.json || true
+
+          cat discovery/cloudfront.json || true
+
+      - name: Upload results
         uses: actions/upload-artifact@v4
         with:
-          name: aws-discovery-results
+          name: ctf-lambda-s3
           path: discovery/

